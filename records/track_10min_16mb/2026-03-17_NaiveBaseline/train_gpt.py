@@ -626,21 +626,28 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_attention: bool = True,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.use_attention = use_attention
+        self.attn_norm = RMSNorm() if self.use_attention else None
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = (
+            CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if self.use_attention else None
+        )
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if self.use_attention else None
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.use_attention:
+            if self.attn is None or self.attn_norm is None or self.attn_scale is None:
+                raise RuntimeError("attention components are required when use_attention=True")
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -671,8 +678,11 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
+        self.blocks = nn.ModuleList()
+        for i in range(num_layers):
+            decoder_idx = i - self.num_encoder_layers
+            drop_decoder_attention = decoder_idx >= 0 and decoder_idx >= self.num_decoder_layers - 3
+            self.blocks.append(
                 Block(
                     model_dim,
                     num_heads,
@@ -680,10 +690,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_attention=not drop_decoder_attention,
                 )
-                for i in range(num_layers)
-            ]
-        )
+            )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
