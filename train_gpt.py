@@ -36,8 +36,8 @@ class Hyperparameters:
     seed = _e("SEED", 1337, int)
     compile_mode = _e("COMPILE_MODE", "default")
     val_batch_size = _e("VAL_BATCH_SIZE", 524288, int)
-    val_loss_every = _e("VAL_LOSS_EVERY", 500, int)
-    train_log_every = _e("TRAIN_LOG_EVERY", 100, int)
+    val_loss_every = _e("VAL_LOSS_EVERY", 0, int)
+    train_log_every = _e("TRAIN_LOG_EVERY", 1000, int)
     iterations = _e("ITERATIONS", 20000, int)
     warmdown_fraction = _e("WARMDOWN_FRACTION", 0.2, float)
     warmup_steps = _e("WARMUP_STEPS", 5, int)
@@ -45,7 +45,7 @@ class Hyperparameters:
     train_seq_len = _e("TRAIN_SEQ_LEN", 1024, int)
     max_wallclock_seconds = _e("MAX_WALLCLOCK_SECONDS", 599.0, float)
     vocab_size = _e("VOCAB_SIZE", 8192, int)
-    num_layers = _e("NUM_LAYERS", 12, int)
+    num_layers = _e("NUM_LAYERS", 11, int)
     num_kv_heads = _e("NUM_KV_HEADS", 4, int)
     model_dim = _e("MODEL_DIM", 768, int)
     num_heads = _e("NUM_HEADS", 8, int)
@@ -771,7 +771,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.softcap_type = softcap_type
         self.num_layers = num_layers
-        self.num_attentionless_tail_layers = min(5, num_layers)
+        self.num_attentionless_tail_layers = min(4, num_layers)
         self.embed_dim = embed_dim if embed_dim > 0 else model_dim
         self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
         self.bigram_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage) if bigram_hash else None
