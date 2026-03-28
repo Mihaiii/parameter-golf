@@ -727,16 +727,17 @@ class Block(nn.Module):
                  tversky_num_features: int=16, tversky_feature_pools: int=0, no_cache: bool=False,
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
-                 diff_attn: bool=False, mlp_groups: int=0):
+                 diff_attn: bool=False, mlp_groups: int=0, use_attention: bool=True):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.use_attention = use_attention
+        self.attn_norm = RMSNorm() if use_attention else None
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         group_size, attn_proj_type, tversky_num_features,
                                         tversky_feature_pools, no_cache, rope_type, yarn_max_len,
-                                        train_seq_len, tversky_membership, diff_attn)
+                                        train_seq_len, tversky_membership, diff_attn) if use_attention else None
         self.mlp = MLP(dim, mlp_mult, group_size, activation, mlp_groups)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if use_attention else None
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.smear = SmearModule(dim) if smear else None
@@ -744,8 +745,9 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0] * x + mix[1] * x0
-        n = self.attn_norm(x)
-        x = x + self.attn_scale.to(dtype=x.dtype) * self.attn(n)
+        if self.use_attention:
+            n = self.attn_norm(x)
+            x = x + self.attn_scale.to(dtype=x.dtype) * self.attn(n)
         x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         if self.smear is not None:
             x = self.smear(x)
@@ -768,6 +770,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.softcap_type = softcap_type
+        self.num_layers = num_layers
+        self.num_attentionless_tail_layers = min(4, num_layers)
         self.embed_dim = embed_dim if embed_dim > 0 else model_dim
         self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
         self.bigram_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage) if bigram_hash else None
@@ -796,15 +800,16 @@ class GPT(nn.Module):
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   group_size, activation, attn_proj_type, tversky_num_features, tversky_feature_pools,
                   no_cache, smear, rope_type, yarn_max_len, train_seq_len, tversky_membership,
-                  diff_attn, mlp_groups)
-            for _ in range(num_layers)
+                  diff_attn, mlp_groups, use_attention=(i < num_layers - self.num_attentionless_tail_layers))
+            for i in range(num_layers)
         ])
 
         # Inject shared feature pool references into attention layers
         if self.tversky_feature_pools_list is not None:
             for i, block in enumerate(self.blocks):
                 pool_idx = (i * tversky_feature_pools) // num_layers
-                block.attn.shared_features = self.tversky_feature_pools_list[pool_idx]
+                if block.attn is not None:
+                    block.attn.shared_features = self.tversky_feature_pools_list[pool_idx]
 
         self.final_norm = RMSNorm()
         self.refiner = CausalConvRefiner(model_dim, kernel_size=refiner_kernel) if refiner else None
