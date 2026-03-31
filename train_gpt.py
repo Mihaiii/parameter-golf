@@ -95,6 +95,11 @@ class Hyperparameters:
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
 
+
+def _num_attention_layers(num_layers: int) -> int:
+    """Keep attention only in the first 60% of layers (last 40% have no attention)."""
+    return num_layers - math.floor(0.4 * num_layers)
+
 # --- Batched Newton-Schulz orthogonalization ---
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
@@ -750,14 +755,21 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        has_attention: bool = True,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.has_attention = has_attention
+        self.attn_norm = RMSNorm() if has_attention else None
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        gated_attention=gated_attention, value_residual=value_residual)
+        self.attn = (
+            CausalSelfAttention(
+                dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                gated_attention=gated_attention, value_residual=value_residual,
+            )
+            if has_attention else None
+        )
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if has_attention else None
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
@@ -767,11 +779,30 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        q_w: Tensor | None,
+        k_w: Tensor | None,
+        v_w: Tensor | None,
+        out_w: Tensor | None,
+        up_w: Tensor,
+        down_w: Tensor,
+        v_embed: Tensor | None = None,
+        v0: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        raw_v = None
+        x_out = x_in
+        if self.has_attention:
+            if q_w is None or k_w is None or v_w is None or out_w is None:
+                raise RuntimeError("Attention weights are required when has_attention=True")
+            attn_out, raw_v = self.attn(
+                self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0
+            )
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
@@ -828,10 +859,12 @@ class GPT(nn.Module):
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
-        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
+        self.num_attention_layers = _num_attention_layers(num_layers)
+        self.qo_bank = nn.Parameter(torch.empty(2 * self.num_attention_layers, model_dim, model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * self.num_attention_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.attn_layer_to_bank = [i if i < self.num_attention_layers else -1 for i in range(num_layers)]
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -846,6 +879,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    has_attention=(i < self.num_attention_layers),
                 )
                 for i in range(num_layers)
             ]
@@ -853,8 +887,9 @@ class GPT(nn.Module):
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
-                block.attn.rope_dims = rope_dims
-                block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
+                if block.attn is not None:
+                    block.attn.rope_dims = rope_dims
+                    block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         kv_dim_ve = self._ve_target_dim
         if self.ve_layer_indices:
@@ -877,15 +912,18 @@ class GPT(nn.Module):
             head._zero_init = True
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
+                if self.blocks[i].attn is not None:
+                    self.blocks[i].attn.use_xsa = True
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        n = self.num_layers
+        n = self.num_attention_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
-        for i in range(n):
+        for i in range(self.num_layers):
+            if i >= self.num_attention_layers:
+                continue
             nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
@@ -912,7 +950,7 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers
+        an = self.num_attention_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -924,9 +962,13 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            ai = self.attn_layer_to_bank[i]
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[ai] if ai >= 0 else None,
+                self.kv_bank[ai] if ai >= 0 else None,
+                self.kv_bank[an + ai] if ai >= 0 else None,
+                self.qo_bank[an + ai] if ai >= 0 else None,
+                self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -936,9 +978,13 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
+            ai = self.attn_layer_to_bank[bi]
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[ai] if ai >= 0 else None,
+                self.kv_bank[ai] if ai >= 0 else None,
+                self.kv_bank[an + ai] if ai >= 0 else None,
+                self.qo_bank[an + ai] if ai >= 0 else None,
+                self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -970,7 +1016,7 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
+        an = self.num_attention_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -982,9 +1028,13 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            ai = self.attn_layer_to_bank[i]
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[ai] if ai >= 0 else None,
+                self.kv_bank[ai] if ai >= 0 else None,
+                self.kv_bank[an + ai] if ai >= 0 else None,
+                self.qo_bank[an + ai] if ai >= 0 else None,
+                self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -994,9 +1044,13 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
+            ai = self.attn_layer_to_bank[bi]
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[ai] if ai >= 0 else None,
+                self.kv_bank[ai] if ai >= 0 else None,
+                self.kv_bank[an + ai] if ai >= 0 else None,
+                self.qo_bank[an + ai] if ai >= 0 else None,
+                self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1247,7 +1301,7 @@ def _quantize_int6_percentile(t32, clip_range=31):
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    n = _num_attention_layers(num_layers)
     for name, tensor in sd.items():
         if name == "qo_bank":
             for i in range(n):
@@ -1258,10 +1312,10 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
                 out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
                 out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
         elif name == "mlp_up_bank":
-            for i in range(n):
+            for i in range(num_layers):
                 out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
         elif name == "mlp_down_bank":
-            for i in range(n):
+            for i in range(num_layers):
                 out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
         else:
             out[name] = tensor
@@ -1270,28 +1324,28 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
 def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     """Convert individual 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    n = _num_attention_layers(num_layers)
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
-    down_slices = [None] * n
+    up_slices = [None] * num_layers
+    down_slices = [None] * num_layers
     consumed = set()
-    for i in range(n):
+    for i in range(num_layers):
         qk = f"blocks.{i}.attn.c_q.weight"
-        if qk in sd:
+        if i < n and qk in sd:
             qo_slices[i] = sd[qk]
             consumed.add(qk)
         ok = f"blocks.{i}.attn.proj.weight"
-        if ok in sd:
+        if i < n and ok in sd:
             qo_slices[n + i] = sd[ok]
             consumed.add(ok)
         kk = f"blocks.{i}.attn.c_k.weight"
-        if kk in sd:
+        if i < n and kk in sd:
             kv_slices[i] = sd[kk]
             consumed.add(kk)
         vk = f"blocks.{i}.attn.c_v.weight"
-        if vk in sd:
+        if i < n and vk in sd:
             kv_slices[n + i] = sd[vk]
             consumed.add(vk)
         fk = f"blocks.{i}.mlp.fc.weight"
@@ -1364,21 +1418,24 @@ class _HessianMLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, has_attention=True):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.has_attention = has_attention
+        self.attn_norm = RMSNorm() if has_attention else None
         self.mlp_norm = RMSNorm()
-        self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if has_attention else None
         self.mlp = _HessianMLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if has_attention else None
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
     def forward(self, x, x0, v_embed=None):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in
+        if self.has_attention:
+            attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
@@ -1393,6 +1450,7 @@ class _HessianGPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
+        self.num_attention_layers = _num_attention_layers(num_layers)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -1402,17 +1460,19 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
+                          layer_idx=i, ln_scale=ln_scale, has_attention=(i < self.num_attention_layers))
             for i in range(num_layers)
         ])
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
-                block.attn.rope_dims = rope_dims
-                block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
+                if block.attn is not None:
+                    block.attn.rope_dims = rope_dims
+                    block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
+                if self.blocks[i].attn is not None:
+                    self.blocks[i].attn.use_xsa = True
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         if self.ve_layer_indices:
@@ -1740,7 +1800,7 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn is not None and b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
